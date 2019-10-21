@@ -3,7 +3,6 @@
  * Copyright: UC Santa Cruz, SSRC
  */
 #include <linux/delay.h>
-#include <lib/bit_vector.h>
 #include <linux/bio.h>
 #include <linux/completion.h>
 #include <linux/device-mapper.h>
@@ -46,13 +45,16 @@ static int
 template_map(struct dm_target *ti, struct bio *bio)
 {
     struct template_context *context = ti->private;
-    int ret = 0;
-    if (override) {
-        bio_set_dev(bio, context->bdev);
-        submit_bio(bio);
-        return DM_MAPIO_SUBMITTED;
+    bio_set_dev(bio, context->dev->bdev);
+
+    //Checks if this bio has a nonzero number of sectors or if the operation is a zone reset
+    if (bio_sectors(bio) || bio_op(bio) == REQ_OP_ZONE_RESET) {
+        bio->bi_iter.bi_sector = context->start + dm_target_offset(ti, bio->bi_iter.bi_sector);
     }
-    return ret;
+
+    //submit_bio(bio);
+    //return DM_MAPIO_SUBMITTED;
+    return DM_MAPIO_REMAPPED;
 }
 
 /**
@@ -64,11 +66,6 @@ template_map(struct dm_target *ti, struct bio *bio)
  * and detect the file system in effect on the passive
  * block device.
  * 
- * It also reads all the files in the entropy directory and
- * creates a hash table of the files, keyed by an 8 byte
- * hash.
- * TODO: ^Implement.
- * 
  * @ti Target instance for new device.
  * @return 0  New device instance successfully created.
  * @return <0 Error.
@@ -77,19 +74,28 @@ static int
 template_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
     struct template_context *context = NULL;
-    int ret;
+    int ret = 0;
+    sector_t tmp;
+    char dummy;
 
     context = kmalloc(sizeof(*context), GFP_KERNEL);
-    args = &context->args;
-    ret = parse_afs_args(args, argc, argv);
-    afs_assert(!ret, args_err, "unable to parse arguments");
 
-    // Acquire the block device based on the args. This gives us a
-    // wrapper on top of the kernel block device structure.
-    ret = dm_get_device(ti, args->dev, dm_table_get_mode(ti->table), &context->dev);
-    context->bdev = context->passive_dev->bdev;
-    context->config.bdev_size = context->bdev->bd_part->nr_sects;
+    ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &context->dev);
+    if (ret) {
+        ti->error = "Invalid block device";
+	goto error;
+    }
 
+    if (sscanf(argv[1], "%lu%c", &tmp, &dummy) != 1 || tmp != (sector_t)tmp) {
+        ti->error = "Invalid device sector";
+	goto error;
+    }
+    context->start = tmp;
+
+    return ret;
+
+error:
+    kfree(context);
     return ret;
 }
 
@@ -108,14 +114,13 @@ template_dtr(struct dm_target *ti)
     // Put the device back.
     dm_put_device(ti, context->dev);
 
-    // Free storage used by context.
     kfree(context);
 }
 
 /** ----------------------------------------------------------- DO-NOT-CROSS ------------------------------------------------------------------- **/
 
 static struct target_type template_target = {
-    .name = "dm-template",
+    .name = "dmtemplate",
     .version = {0,0,1},
     .module = THIS_MODULE,
     .ctr = template_ctr,
